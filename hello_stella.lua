@@ -89,6 +89,7 @@ local success, err = xpcall(function()
     local players = services.Players
     local replicated_storage = services.ReplicatedStorage
     local workspace = services.Workspace
+    local collection_service = services.CollectionService
 
     -- chat capture: hook .Chatted for everyone, stamp w/ servertime so backend dedups
     local chat_buffer = {}
@@ -191,6 +192,12 @@ local success, err = xpcall(function()
         ["Galvanize"] = "Construct",
         ["Pumpkin Grenade"] = "Dullahan",
         ["Biting Grenade"] = "Dullahan",
+    }
+
+    local special_races = {
+        ["Lich"] = true,
+        ["Seraph"] = true,
+        ["Navaran"] = true,
     }
 
     local function colors_match(c1, c2, tolerance)
@@ -391,7 +398,7 @@ local success, err = xpcall(function()
                     if ok and eye_color then
                         for _, v in next, race_eye_colors do
                             local ref_color, race_name = v[1], v[2]
-                            if colors_match(eye_color, ref_color) then
+                            if colors_match(eye_color, ref_color) and not special_races[race_name] then
                                 race_found = race_name
                                 break
                             end
@@ -403,7 +410,7 @@ local success, err = xpcall(function()
                     local success, head_color = pcall(function() return head.Color end)
                     if success and head_color then
                         local m = nearest_race(head_color, race_colors)
-                        if m then race_found = m end
+                        if m and not special_races[m] then race_found = m end
                     end
                 end
             end
@@ -933,6 +940,25 @@ local success, err = xpcall(function()
         return out
     end
 
+    local current_server_is_public = nil
+    local function read_public()
+        local lp = players.LocalPlayer
+        local pg = lp and lp:FindFirstChild("PlayerGui")
+        local start_menu = pg and pg:FindFirstChild("StartMenu")
+        local public_servers = start_menu and start_menu:FindFirstChild("PublicServers")
+        local scroll = public_servers and public_servers:FindFirstChild("ScrollingFrame")
+        if not scroll then return nil end
+        local rows = scroll:GetChildren()
+        if #rows < 2 then return nil end
+        for _, frame in ipairs(rows) do
+            local name_label = frame:FindFirstChild("ServerName")
+            if name_label and name_label:IsA("TextLabel") and string.find(name_label.Text, "(Current)", 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
     local function collect_all_data()
         local player_list = {}
         local current_player_list = {}
@@ -1012,6 +1038,15 @@ local success, err = xpcall(function()
                 is_public = false,
                 loot_zones = loot_zones,
             })
+        end
+
+        if current_server_is_public ~= nil then
+            for _, server in ipairs(servers) do
+                if server.job_id == current_job_id then
+                    server.is_public = current_server_is_public
+                    break
+                end
+            end
         end
         
         local known_job_ids = {}
@@ -1110,6 +1145,20 @@ local success, err = xpcall(function()
         debug_info("print", "Player data collector started")
         debug_info("print", "Sending data every", config.send_interval, "seconds")
 
+        pcall(function()
+            local lp = players.LocalPlayer
+            for _ = 1, 40 do
+                if lp and lp.Character then break end
+                local pub = read_public()
+                if pub ~= nil then
+                    current_server_is_public = pub
+                    break
+                end
+                task.wait(0.1)
+            end
+            getgenv().stella_public = { job = game.JobId, public = current_server_is_public }
+        end)
+
         pcall(init_race_colors)
         pcall(init_face_map)
         pcall(init_chat_capture)
@@ -1119,7 +1168,9 @@ local success, err = xpcall(function()
             local ok, err = pcall(function()
                 local payload = collect_all_data()
                 debug_info("print", "Collected", #payload.players, "players")
-                send_payload(payload)
+                if send_payload(payload) then
+                    getgenv().stella_sent = { job = game.JobId }
+                end
             end)
             if not ok then
                 debug_info("warn", "Collect/send cycle errored, retrying next tick:", tostring(err))
@@ -1133,6 +1184,7 @@ local success, err = xpcall(function()
     local ws_url = config.api_url:gsub("^http", "ws"):gsub("/bulk$", "/ws/positions") .. "?token=" .. config.api_token
         .. "&rid=" .. tostring(players.LocalPlayer and players.LocalPlayer.UserId or 0)
     local positions_url = config.api_url:gsub("/bulk$", "/positions")
+    local TAG_WHITELIST = { Unconscious = true, Danger = true } -- only report these character tags (parsed server-side)
     local function gather_positions()
         local list = {}
         for _, plr in ipairs(players:GetPlayers()) do
@@ -1141,12 +1193,16 @@ local success, err = xpcall(function()
             if hrp then
                 local hum = char:FindFirstChildOfClass("Humanoid")
                 local p = hrp.Position
-                list[#list + 1] = {
+                local entry = {
                     id = plr.UserId, name = plr.Name,
                     x = math.floor(p.X), y = math.floor(p.Y), z = math.floor(p.Z),
                     hp = hum and math.floor(hum.Health) or nil,
                     maxhp = hum and math.floor(hum.MaxHealth) or nil,
                 }
+                for _, t in ipairs(collection_service:GetTags(char)) do
+                    if TAG_WHITELIST[t] then entry.tags = entry.tags or {}; entry.tags[#entry.tags + 1] = t end
+                end
+                list[#list + 1] = entry
             end
         end
         return list
@@ -1162,14 +1218,40 @@ local success, err = xpcall(function()
         if not ok or not sock then return nil end
         return sock
     end
+    local bot_float = false -- latches once noclip is seen; stays hidden until they leave the server
+    task.spawn(function()
+        local jump_since = nil
+        while not bot_float do
+            local ok = pcall(function()
+                local char = players.LocalPlayer and players.LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if char and hum and hum:GetState() == Enum.HumanoidStateType.Jumping then
+                    jump_since = jump_since or os.clock()
+                    local held = os.clock() - jump_since
+                    local collides = false
+                    for _, v in ipairs(char:GetDescendants()) do
+                        if v:IsA("BasePart") and v.CanCollide and v.Name ~= "HumanoidRootPart" then collides = true; break end
+                    end
+                    if (not collides and held > 0.8) or held > 2 then bot_float = true end
+                else
+                    jump_since = nil
+                end
+            end)
+            if not ok then jump_since = nil end
+            task.wait(0.4)
+        end
+    end)
     -- hide self from the map while botting: bot sets MemStorageService "botstarted"/"blatant" = "true"
     local function bot_active()
-        local ok, v = pcall(function()
+        if bot_float then return true end
+        local mok, mv = pcall(function()
             local mem = services.MemStorageService
             local function flag(key) return mem:HasItem(key) and mem:GetItem(key) == "true" end
             return flag("botstarted") or flag("blatant")
         end)
-        return ok and v == true
+        if mok and mv == true then return true end
+        local kok, kv = pcall(function() return getgenv().KHV3Executed and true or false end)
+        return kok and kv == true
     end
     task.spawn(function()
         local priv = false
@@ -1205,11 +1287,12 @@ local success, err = xpcall(function()
                 mode = "http"; debug_info("warn", "websocket lost, positions over http")
             end
 
-            if #list > 0 then
+            local me = players.LocalPlayer
+            local hiding = (me and (config.hide_self == true or (config.hide_self ~= false and bot_active()))) or false
+            -- also send while hiding so the self-hide signal registers even in sparse servers
+            if #list > 0 or hiding then
                 local frame = { job_id = game.JobId, players = list, count = #players:GetPlayers(), place = game.PlaceId }
-                local me = players.LocalPlayer
-                -- true = always hide; false = never (even botting); nil = auto-hide only while botting
-                if me and (config.hide_self == true or (config.hide_self ~= false and bot_active())) then frame.me = me.UserId end
+                if hiding then frame.me = me.UserId end
                 if ws and mode == "ws" then
                     local ok = pcall(function() ws:Send(http_service:JSONEncode(frame)) end)
                     if not ok then pcall(function() ws:Close() end); ws = nil; healthy_at = nil; mode = "http" end
@@ -1233,6 +1316,7 @@ local success, err = xpcall(function()
     end)
 
     pcall(function()
+        if getgenv().stella_finder_drive then return end
         local queue = queue_on_teleport or queueteleport
         if not queue then
             debug_info("warn", "no queue_on_teleport; won't auto execute after serverhop")
