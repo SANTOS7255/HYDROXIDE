@@ -10,6 +10,8 @@ pcall(function()
 end)
 --]]
 
+
+--[[
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -1374,3 +1376,4 @@ end)
 if not success then
     warn("[Stella] Script error:", err)
 end
+--]]
